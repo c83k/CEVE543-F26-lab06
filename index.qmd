@@ -391,16 +391,279 @@ If you fit a GPD, this cell finds the peaks over a threshold and joins each peak
 The threshold of 25.4 mm and the 72-hour gap between storms are made up to show the code; choose your own and defend them, as in lab 5.
 `decluster` keeps the largest day in each storm, and `rate` is the number of peaks per year you kept, which you pass to `returnlevel`.
 
+### Choosing the threshold
+
+A GPD fits the excesses only above a high enough threshold.
+Above that threshold, the mean excess should be roughly a straight line in the threshold (@fig-mrl), and the shape $\xi$ and the reparameterized scale $\sigma^* = \sigma_u - \xi u$ should stay roughly constant (@fig-stability).
+Both plots use declustered storm peaks above 12.7 mm, so that the days within one storm are not counted twice.
+
+```{julia}
+#| solution: false
+#| label: fig-mrl
+#| fig-cap: "Mean residual life of declustered storm peaks at Hobby, with a 95% band."
+storm_idx, _ = decluster(DateTime.(daily.date), daily.prcp_mm, 12.7; min_gap_hours=72)
+storm_peaks = daily.prcp_mm[storm_idx]
+mrl_plot(storm_peaks; lo=12.7, hi=127)
+```
+
+```{julia}
+#| solution: false
+#| label: fig-stability
+#| fig-cap: "Parameter stability of the GPD fitted to declustered storm peaks at Hobby, with 95% bands."
+stability_plot(storm_peaks; lo_quantile=0.0, hi_quantile=0.97)
+```
+
+@tbl-threshold fits a stationary GPD by maximum likelihood at several thresholds and two gaps between storms.
+
+```{julia}
+#| solution: false
+#| label: tbl-threshold
+#| tbl-cap: "Number of storm peaks, storms per year, and fitted shape for each threshold and gap."
+threshold_table = DataFrame(u_mm=Float64[], gap_hours=Int[], n_peaks=Int[], rate=Float64[], ξ=Float64[])
+for u_try in (25.4, 38.1, 50.8, 63.5, 76.2), gap in (48, 72)
+    idx, _ = decluster(DateTime.(daily.date), daily.prcp_mm, u_try; min_gap_hours=gap)
+    fit = gpfit(daily.prcp_mm[idx], u_try)
+    push!(threshold_table, (u_try, gap, length(idx), round(length(idx) / length(keep); digits=2), round(params(fit).β_shape[1]; digits=2)))
+end
+threshold_table
+```
+
 ```{julia}
 #| solution: false
 #| output: false
-u = 25.4
+u = 50.8
 peak_idx, _ = decluster(DateTime.(daily.date), daily.prcp_mm, u; min_gap_hours=72)
 peaks = innerjoin(daily[peak_idx, [:year, :prcp_mm]], covariates; on=:year)
 rate = nrow(peaks) / length(keep)
 ```
 
 Fit the peaks with the table form, such as `gpfitbayes(peaks, :prcp_mm, u; logscalecovid=[:log_CO2], rng=rng, progress=false)`.
+
+### Choosing the covariate
+
+Log CO2 and GMST both rise over the record, so they may carry the same information.
+@tbl-cov-cor gives their correlations over the years kept, and @fig-cov-scatter plots GMST against log CO2.
+
+```{julia}
+#| solution: false
+#| label: tbl-cov-cor
+#| tbl-cap: "Correlation between the candidate covariates over the years kept."
+cov_names = [:log_CO2, :gmst, :nino34]
+cov_kept = filter(r -> r.year in keep, covariates)
+cov_cor = round.(cor(Matrix(cov_kept[:, cov_names])); digits=2)
+cov_cor_table = DataFrame(cov_cor, cov_names)
+insertcols!(cov_cor_table, 1, :covariate => string.(cov_names))
+```
+
+```{julia}
+#| solution: false
+#| label: fig-cov-scatter
+#| fig-cap: "GMST anomaly against log CO2 in each year kept, colored by year."
+fig = Figure(; size=(500, 400))
+ax = Axis(fig[1, 1]; xlabel="log CO2", ylabel="GMST anomaly (°C)")
+sc = scatter!(ax, cov_kept.log_CO2, cov_kept.gmst; color=cov_kept.year, markersize=7)
+Colorbar(fig[1, 2], sc; label="year")
+fig
+```
+
+@tbl-lr compares a trend in the log scale on each covariate with the stationary GPD, fitted by maximum likelihood.
+Twice the gain in log likelihood is compared with 3.84, the 95% point of a chi-squared distribution with one degree of freedom.
+
+```{julia}
+#| solution: false
+#| label: tbl-lr
+#| tbl-cap: "Slope of the log scale per unit of each covariate and twice the gain in log likelihood over the stationary GPD."
+gp_stat = gpfit(peaks, :prcp_mm, u)
+lr_table = DataFrame(covariate=String[], slope=Float64[], twice_ΔLL=Float64[])
+for c in cov_names
+    fit = gpfit(peaks, :prcp_mm, u; logscalecovid=[c])
+    push!(lr_table, (string(c), round(params(fit).β_logscale[2]; digits=3), round(2 * (loglike(fit) - loglike(gp_stat)); digits=2)))
+end
+lr_table
+```
+
+### Is the storm rate changing?
+
+`gpfitbayes` holds the number of storms per year fixed, so check whether it trends.
+@fig-storm-rate counts the storm peaks above the threshold in each year kept.
+
+```{julia}
+#| solution: false
+#| label: fig-storm-rate
+#| fig-cap: "Storm peaks above the threshold in each year kept at Hobby."
+storm_counts = combine(groupby(peaks, :year), nrow => :n)
+storm_counts = sort(leftjoin(DataFrame(year=keep), storm_counts; on=:year), :year)
+storm_counts.n = coalesce.(storm_counts.n, 0)
+@printf("Storms per year: %.2f before 1985, %.2f from 1985; correlation with year %.2f\n",
+    mean(storm_counts.n[storm_counts.year .< 1985]), mean(storm_counts.n[storm_counts.year .>= 1985]),
+    cor(storm_counts.year, storm_counts.n))
+
+fig = Figure(; size=(700, 300))
+ax = Axis(fig[1, 1]; xlabel=L"\text{year}", ylabel=L"\text{storms above threshold}")
+scatterlines!(ax, storm_counts.year, storm_counts.n; color=colors[1], markersize=5)
+fig
+```
+
+### Bayesian fit
+
+The log scale is a straight line in log CO2, the shape is constant, and every prior is the flat default:
+
+$$
+y_i - u \sim \text{GPD}\left(\exp(\beta_0 + \beta_1 \log \text{CO2}_i), \; \xi\right).
+$$
+
+```{julia}
+#| solution: false
+gp_co2 = gpfitbayes(peaks, :prcp_mm, u; logscalecovid=[:log_CO2], rng=rng, progress=false)
+DataFrame(summarystats(gp_co2.estimate))
+```
+
+The slope $\beta_1$ is the change in the log scale per unit of log CO2, so a doubling of CO2 multiplies the scale by $2^{\beta_1}$.
+
+```{julia}
+#| solution: false
+β1 = params(gp_co2).β_logscale[:, 2]
+@printf("β1: median %.2f [%.2f, %.2f]; P(β1 > 0) = %.2f\n",
+    median(β1), quantile(β1, 0.025), quantile(β1, 0.975), mean(β1 .> 0))
+println("Change in scale per doubling of CO2 (%): ", interval(100 .* (2 .^ β1 .- 1)))
+```
+
+### Return levels
+
+Each return level needs a CO2 value for its year.
+1986 comes from the record.
+2026 is the 2025 value plus about 2.5 ppm, the recent yearly rise at Mauna Loa.
+2066 depends on future emissions, so it is given for three Shared Socioeconomic Pathways (SSPs): SSP1-2.6 (low emissions), SSP2-4.5 (middle) and SSP5-8.5 (high).
+Table 5 of @meinshausen_sspgreenhouse:2020 gives the global-mean CO2 of each pathway in 2050 and 2075, and the cell interpolates between them in log CO2, which gives about 470, 550 and 706 ppm in 2066.
+These are global means, about a part per million below the Mauna Loa values in the record, a difference too small to matter here.
+
+```{julia}
+#| solution: false
+interval(v) = round.(quantile(v, [0.025, 0.5, 0.975]))   # 2.5%, 50%, 97.5% of the draws, in mm
+co2_1986 = covariates.log_CO2[covariates.year .== 1986][1]
+co2_2026 = log(exp(covariates.log_CO2[end]) + 2.5)
+ssp_co2 = (low=(469.3, 471.0), middle=(506.9, 575.5), high=(562.8, 801.7))   # ppm in 2050 and 2075: SSP1-2.6, SSP2-4.5, SSP5-8.5
+w_2066 = (2066 - 2050) / (2075 - 2050)
+co2_2066 = map(c -> (1 - w_2066) * log(c[1]) + w_2066 * log(c[2]), ssp_co2)
+@printf("CO2 in 2066 (ppm): low %.0f, middle %.0f, high %.0f\n", exp(co2_2066.low), exp(co2_2066.middle), exp(co2_2066.high))
+co2_report = [co2_1986, co2_2026, co2_2066.low, co2_2066.middle, co2_2066.high]
+
+rl10_gp = returnlevel(gp_co2, 10; rate=rate, logscalecov=[co2_report])
+rl100_gp = returnlevel(gp_co2, 100; rate=rate, logscalecov=[co2_report])
+
+for (T, rl) in ((10, rl10_gp), (100, rl100_gp))
+    println("$T-year level in 2026 (mm): ", interval(rl[:, 2]))
+    println("  change, 1986 to 2026 (mm): ", interval(rl[:, 2] .- rl[:, 1]))
+    for (k, name) in enumerate(keys(co2_2066))
+        println("  change, 2026 to 2066, $name emissions (mm): ", interval(rl[:, 2 + k] .- rl[:, 2]))
+    end
+end
+@printf("100-year trend, 1986 to 2026: median %.2f mm per year, to compare with 1.93 from Fagnant et al.\n",
+    median(rl100_gp[:, 2] .- rl100_gp[:, 1]) / 40)
+```
+
+@fig-rl-time plots the 10- and 100-year levels in each year of the record, with the annual maxima for reference.
+
+```{julia}
+#| solution: false
+#| label: fig-rl-time
+#| fig-cap: "The 10- and 100-year daily rainfall at Hobby through the record from the GPD fit on log CO2 (posterior median and 95% interval), and the annual maxima."
+fig = Figure(; size=(700, 350))
+ax = Axis(fig[1, 1]; xlabel=L"\text{year}", ylabel=L"\text{daily rainfall (mm)}")
+for (k, T) in enumerate([10, 100])
+    rl = returnlevel(gp_co2, T; rate=rate, logscalecov=[cov_kept.log_CO2])
+    band!(ax, cov_kept.year, quantile.(eachcol(rl), 0.025), quantile.(eachcol(rl), 0.975); color=(colors[k], 0.2))
+    lines!(ax, cov_kept.year, median.(eachcol(rl)); color=colors[k], linewidth=2, label="$T-year level")
+end
+scatter!(ax, annmax.year, annmax.y; color=:black, markersize=5, label="annual maxima")
+axislegend(ax; position=:lt)
+fig
+```
+
+### Sensitivity to the threshold
+
+@tbl-threshold-sensitivity refits the same model at a higher threshold, 63.5 mm (2.5 inches), with the same 72-hour gap, and compares the 100-year levels with the fit at 50.8 mm.
+If the threshold is high enough, raising it should change the levels little beyond widening the intervals.
+
+```{julia}
+#| solution: false
+#| label: tbl-threshold-sensitivity
+#| tbl-cap: "The 100-year level in 2026 and its changes, in mm (2.5%, 50%, 97.5%), at two thresholds; the 2066 change uses the middle emissions scenario."
+sensitivity = DataFrame(u_mm=Float64[], n_peaks=Int[], rl100_2026=String[], change_1986_2026=String[], change_2026_2066=String[])
+for u_try in (50.8, 63.5)
+    idx, _ = decluster(DateTime.(daily.date), daily.prcp_mm, u_try; min_gap_hours=72)
+    peaks_try = innerjoin(daily[idx, [:year, :prcp_mm]], covariates; on=:year)
+    fit = gpfitbayes(peaks_try, :prcp_mm, u_try; logscalecovid=[:log_CO2], rng=rng, progress=false)
+    rl = returnlevel(fit, 100; rate=nrow(peaks_try) / length(keep), logscalecov=[co2_report])
+    push!(sensitivity, (u_try, nrow(peaks_try), string(interval(rl[:, 2])),
+        string(interval(rl[:, 2] .- rl[:, 1])), string(interval(rl[:, 4] .- rl[:, 2]))))
+end
+sensitivity
+```
+
+## Key questions
+
+All numbers are posterior medians with 95% intervals from the GPD fit on log CO2 above.
+
+**1. What is your best estimate for the 10- and 100-year return levels in 2026?**
+
+The 10-year daily rainfall in 2026 is about 217 mm (8.5 inches), and the 100-year daily rainfall is about 394 mm (15.5 inches).
+For scale, the wettest day in the Hobby record is 307 mm, on August 26, 2017, during Hurricane Harvey.
+
+**2. How uncertain are these estimates?**
+
+The 95% interval is 172 to 291 mm for the 10-year level and 274 to 648 mm for the 100-year level.
+The 100-year interval is wide because that level is rarer than almost anything in 80 years of data.
+These intervals cover only the uncertainty in the model's parameters.
+They leave out the uncertainty in the storm rate, which is held fixed at about 4 storms a year; my choice of threshold, declustering gap, covariate and straight-line form; and the chance that days are missing for reasons tied to the rain, such as a gauge failing in a big storm.
+The true uncertainty is wider.
+
+**3. How have these return levels changed over the past 40 years?**
+
+From 1986 to 2026, the 10-year level rose by about 20 mm (−23 to +78) and the 100-year level by about 41 mm (−52 to +174), or about 1.0 mm per year (−1.3 to +4.3).
+About 80% of the posterior draws of the CO2 slope are positive, so the record leans toward an increase, but both intervals include zero, so no change cannot be ruled out.
+@fagnant_spatiotemporal:2020 report 1.93 mm per year (1.50 to 2.35) for the 100-year level at Hobby.
+My median is about half of theirs and my interval is much wider, but their value lies inside my interval, so the results do not conflict.
+They pooled more than 600 gauges; one gauge cannot pin the trend down as tightly.
+
+**4. How will these return levels change over the next 40 years, and what assumptions do you make in projecting these?**
+
+The change from 2026 to 2066 depends on future CO2:
+
+| Scenario | CO2 in 2066 | 10-year change (mm) | 100-year change (mm) |
+| :--- | ---: | ---: | ---: |
+| SSP1-2.6 (low) | 470 ppm | +9 (−9 to +44) | +19 (−19 to +98) |
+| SSP2-4.5 (middle) | 550 ppm | +26 (−23 to +140) | +55 (−50 to +311) |
+| SSP5-8.5 (high) | 706 ppm | +57 (−42 to +371) | +120 (−91 to +816) |
+
+Every interval includes zero.
+The projection assumes that the log scale of storm size stays a straight line in log CO2 beyond the range of the data, that the number of storms above the threshold stays at about 4 a year, and that CO2 follows the SSP pathways of @meinshausen_sspgreenhouse:2020, interpolated to 2066.
+The intervals widen with emissions because higher CO2 extrapolates further past the record.
+
+## Key decisions
+
+**1. GEV or GPD?**
+
+I fit a GPD to peaks over a threshold, because it uses 317 storms instead of 80 annual maxima.
+I kept the years with at least 350 valid days, from 1940 to 2025, which leaves 80 years.
+I declustered with a 72-hour gap, so rain days less than three days apart count as one storm and only its largest day is kept; gaps of 48 and 120 hours change the number of storms by less than 3%.
+I chose a threshold of 50.8 mm (2 inches) because the mean residual life plot is roughly straight and the shape parameter is roughly stable from about 50 to 65 mm (@fig-mrl, @fig-stability, @tbl-threshold), while still leaving about 4 storms a year.
+Refitting at 63.5 mm gives nearly the same 2026 100-year level (@tbl-threshold-sensitivity).
+
+**2. Stationary or nonstationary?**
+
+I fit a nonstationary model because the question is whether rainfall is changing, and warmer air holds about 7% more water vapor per °C.
+None of the covariates gives a significant improvement over the stationary model in a likelihood-ratio test (@tbl-lr), so I use the model to measure the trend and its uncertainty rather than to claim one.
+I let the log scale depend on log CO2.
+Log CO2 and GMST are correlated at 0.96 (@tbl-cov-cor), so I used only one; I chose log CO2 because it is the physical driver and the SSP scenarios give its value in 2066.
+Niño 3.4 has no long-term trend and explained almost nothing.
+The number of storms per year shows no trend (correlation with year 0.03, @fig-storm-rate), so I held the rate fixed and let only storm size change.
+
+**3. How did you estimate your uncertainty?**
+
+I used a Bayesian fit with `gpfitbayes` and the default flat priors on every coefficient, so the result reflects the Hobby record alone.
+The chains converged, with `rhat` near 1 and `ess_bulk` in the thousands.
+The intervals are the 2.5% and 97.5% quantiles of the posterior draws of each return level.
 
 ## Turning it in
 
